@@ -80,7 +80,7 @@ class CNode {
     CAddress me(CService("0.0.0.0"));
     BeginMessage("version");
     int nBestHeight = GetRequireHeight();
-    string ver = "/bitcoin-seeder:0.01/";
+    string ver = "/flux_seeder:1.00/";
     uint8_t fRelayTxs = 0;
     vSend << PROTOCOL_VERSION << nLocalServices << nTime << you << me << nLocalNonce << ver << nBestHeight << fRelayTxs;
     EndMessage();
@@ -98,7 +98,7 @@ class CNode {
   }
 
   bool ProcessMessage(string strCommand, CDataStream& vRecv) {
-//    printf("%s: RECV %s\n", ToString(you).c_str(), strCommand.c_str());
+    //printf("%s: RECV %s\n", ToString(you).c_str(), strCommand.c_str());
     if (strCommand == "version") {
       int64 nTime;
       CAddress addrMe;

@@ -81,3 +81,20 @@ the -p 15353 option.
 Another solution is allowing a binary to bind to ports < 1024 with setcap (IPv6 access-safe)
 
 $ setcap 'cap_net_bind_service=+ep' /path/to/dnsseed
+
+BLONDFROGS STEPS (This worked for blondfrogs, but aren't guaranteed, asoftwaresolution is a google domain)
+----------------
+
+1. Create the NS entry for whatever domain you own e.g(dnsseed.asoftwaresolution.com) pointing to the A record of where
+you are going to run the flux-seeder e.g(flux-seeder.asoftwaresolution.com)
+
+2. On the machine (flux-seeder.asoftwaresolution.com) build flux-seeder, and run it with the following command
+$ ./dnsseed -h dnsseed.asoftwaresolution.com -n flux-seeder.asoftwaresolution.com -m email@example.com -a <ip of flux-seeder>
+
+3. DNSSeeder will start to crawl the flux network building a list of good ip addresses that the DNS server can use
+
+4. Test the DNSSeeder by running on a different machine.
+$ nslookup dnsseed.asoftwaresolution.com
+
+5. Test locally on machine by running
+$ dig localhost dnsseed.asoftwaresolution.com
