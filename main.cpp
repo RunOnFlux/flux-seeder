@@ -424,17 +424,48 @@ static const string testnet_seeds[] = {"flux-testnet-seed.asoftwaresolution.com"
 static const string *seeds = mainnet_seeds;
 
 extern "C" void* ThreadSeeder(void*) {
+  printf("=== ThreadSeeder started ===\n");
+  printf("ThreadSeeder: fTestNet = %s\n", fTestNet ? "true" : "false");
+  printf("ThreadSeeder: GetDefaultPort() = %d\n", GetDefaultPort());
+  
   if (!fTestNet){
+    printf("ThreadSeeder: Running in mainnet mode\n");
 //    db.Add(CService("kjy2eqzk4zwi5zd3.onion", 8333), true);
+  } else {
+    printf("ThreadSeeder: Running in testnet mode\n");
   }
+  
   do {
+    printf("\n=== ThreadSeeder: Starting seed round ===\n");
+    int total_ips_added = 0;
+    
     for (int i=0; seeds[i] != ""; i++) {
+      printf("ThreadSeeder: [%d] Looking up '%s'\n", i, seeds[i].c_str());
       vector<CNetAddr> ips;
-      LookupHost(seeds[i].c_str(), ips);
-      for (vector<CNetAddr>::iterator it = ips.begin(); it != ips.end(); it++) {
-        db.Add(CService(*it, GetDefaultPort()), true);
+      
+      try {
+        LookupHost(seeds[i].c_str(), ips);
+        printf("ThreadSeeder: [%d] Found %d IPs for %s\n", i, (int)ips.size(), seeds[i].c_str());
+        
+        for (vector<CNetAddr>::iterator it = ips.begin(); it != ips.end(); it++) {
+          string ip_str = it->ToString();
+          int port = GetDefaultPort();
+          printf("ThreadSeeder: [%d] Adding %s:%d to database\n", i, ip_str.c_str(), port);
+          
+          CService service(*it, port);
+          printf("ThreadSeeder: [%d] CService created: %s\n", i, service.ToString().c_str());
+          
+          db.Add(service, true);
+          total_ips_added++;
+          printf("ThreadSeeder: [%d] Successfully added to db (total: %d)\n", i, total_ips_added);
+        }
+      } catch (const std::exception& e) {
+        printf("ThreadSeeder: [%d] Exception looking up %s: %s\n", i, seeds[i].c_str(), e.what());
       }
     }
+    
+    printf("ThreadSeeder: Round complete. Added %d total IPs\n", total_ips_added);
+    printf("ThreadSeeder: Sleeping for 30 minutes (1800000ms)...\n");
     Sleep(1800000);
   } while(1);
   return nullptr;

@@ -80,7 +80,7 @@ class CNode {
     CAddress me(CService("0.0.0.0"));
     BeginMessage("version");
     int nBestHeight = GetRequireHeight();
-    string ver = "/flux_seeder:1.00/";
+    string ver = "/MagicBean:8.0.0/";
     uint8_t fRelayTxs = 0;
     vSend << PROTOCOL_VERSION << nLocalServices << nTime << you << me << nLocalNonce << ver << nBestHeight << fRelayTxs;
     EndMessage();
