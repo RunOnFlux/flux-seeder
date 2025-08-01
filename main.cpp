@@ -184,29 +184,39 @@ CAddrDb db;
 
 extern "C" void* ThreadCrawler(void* data) {
   int *nThreads=(int*)data;
+  printf("=== ThreadCrawler started ===\n");
   do {
     std::vector<CServiceResult> ips;
     int wait = 5;
+    printf("Crawler: Getting nodes from database...\n");
     db.GetMany(ips, 16, wait);
     int64 now = time(NULL);
     if (ips.empty()) {
+      printf("Crawler: No nodes to test, waiting %d seconds\n", wait);
       wait *= 1000;
       wait += rand() % (500 * *nThreads);
       Sleep(wait);
       continue;
     }
+    printf("Crawler: Got %d nodes to test\n", (int)ips.size());
     vector<CAddress> addr;
     for (int i=0; i<ips.size(); i++) {
       CServiceResult &res = ips[i];
+      printf("Crawler: [%d] Testing node %s\n", i, res.service.ToString().c_str());
       res.nBanTime = 0;
       res.nClientV = 0;
       res.nHeight = 0;
       res.strClientV = "";
       res.services = 0;
       bool getaddr = res.ourLastSuccess + 86400 < now;
+      printf("Crawler: [%d] Calling TestNode (getaddr=%s)\n", i, getaddr ? "true" : "false");
       res.fGood = TestNode(res.service,res.nBanTime,res.nClientV,res.strClientV,res.nHeight,getaddr ? &addr : NULL, res.services);
+      printf("Crawler: [%d] TestNode result: %s (ban=%d, version=%d, height=%d, services=0x%llx)\n", 
+             i, res.fGood ? "GOOD" : "BAD", res.nBanTime, res.nClientV, res.nHeight, (unsigned long long)res.services);
     }
+    printf("Crawler: Submitting results to database...\n");
     db.ResultMany(ips);
+    printf("Crawler: Adding %d new addresses discovered\n", (int)addr.size());
     db.Add(addr);
   } while(1);
   return nullptr;

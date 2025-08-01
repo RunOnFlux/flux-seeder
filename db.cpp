@@ -34,7 +34,9 @@ bool CAddrDb::Get_(CServiceResult &ip, int &wait) {
   int64 now = time(NULL);
   int cont = 0;
   int tot = unkId.size() + ourId.size();
+  printf("DB::Get_ called: unknown=%d, tried=%d, total=%d\n", (int)unkId.size(), (int)ourId.size(), tot);
   if (tot == 0) {
+    printf("DB::Get_ no nodes available, returning false\n");
     wait = 5;
     return false;
   }
