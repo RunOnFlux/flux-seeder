@@ -184,39 +184,29 @@ CAddrDb db;
 
 extern "C" void* ThreadCrawler(void* data) {
   int *nThreads=(int*)data;
-  printf("=== ThreadCrawler started ===\n");
   do {
     std::vector<CServiceResult> ips;
     int wait = 5;
-    printf("Crawler: Getting nodes from database...\n");
     db.GetMany(ips, 16, wait);
     int64 now = time(NULL);
     if (ips.empty()) {
-      printf("Crawler: No nodes to test, waiting %d seconds\n", wait);
       wait *= 1000;
       wait += rand() % (500 * *nThreads);
       Sleep(wait);
       continue;
     }
-    printf("Crawler: Got %d nodes to test\n", (int)ips.size());
     vector<CAddress> addr;
     for (int i=0; i<ips.size(); i++) {
       CServiceResult &res = ips[i];
-      printf("Crawler: [%d] Testing node %s\n", i, res.service.ToString().c_str());
       res.nBanTime = 0;
       res.nClientV = 0;
       res.nHeight = 0;
       res.strClientV = "";
       res.services = 0;
       bool getaddr = res.ourLastSuccess + 86400 < now;
-      printf("Crawler: [%d] Calling TestNode (getaddr=%s)\n", i, getaddr ? "true" : "false");
       res.fGood = TestNode(res.service,res.nBanTime,res.nClientV,res.strClientV,res.nHeight,getaddr ? &addr : NULL, res.services);
-      printf("Crawler: [%d] TestNode result: %s (ban=%d, version=%d, height=%d, services=0x%llx)\n", 
-             i, res.fGood ? "GOOD" : "BAD", res.nBanTime, res.nClientV, res.nHeight, (unsigned long long)res.services);
     }
-    printf("Crawler: Submitting results to database...\n");
     db.ResultMany(ips);
-    printf("Crawler: Adding %d new addresses discovered\n", (int)addr.size());
     db.Add(addr);
   } while(1);
   return nullptr;
@@ -434,48 +424,17 @@ static const string testnet_seeds[] = {"flux-testnet-seed.asoftwaresolution.com"
 static const string *seeds = mainnet_seeds;
 
 extern "C" void* ThreadSeeder(void*) {
-  printf("=== ThreadSeeder started ===\n");
-  printf("ThreadSeeder: fTestNet = %s\n", fTestNet ? "true" : "false");
-  printf("ThreadSeeder: GetDefaultPort() = %d\n", GetDefaultPort());
-  
   if (!fTestNet){
-    printf("ThreadSeeder: Running in mainnet mode\n");
 //    db.Add(CService("kjy2eqzk4zwi5zd3.onion", 8333), true);
-  } else {
-    printf("ThreadSeeder: Running in testnet mode\n");
   }
-  
   do {
-    printf("\n=== ThreadSeeder: Starting seed round ===\n");
-    int total_ips_added = 0;
-    
     for (int i=0; seeds[i] != ""; i++) {
-      printf("ThreadSeeder: [%d] Looking up '%s'\n", i, seeds[i].c_str());
       vector<CNetAddr> ips;
-      
-      try {
-        LookupHost(seeds[i].c_str(), ips);
-        printf("ThreadSeeder: [%d] Found %d IPs for %s\n", i, (int)ips.size(), seeds[i].c_str());
-        
-        for (vector<CNetAddr>::iterator it = ips.begin(); it != ips.end(); it++) {
-          string ip_str = it->ToString();
-          int port = GetDefaultPort();
-          printf("ThreadSeeder: [%d] Adding %s:%d to database\n", i, ip_str.c_str(), port);
-          
-          CService service(*it, port);
-          printf("ThreadSeeder: [%d] CService created: %s\n", i, service.ToString().c_str());
-          
-          db.Add(service, true);
-          total_ips_added++;
-          printf("ThreadSeeder: [%d] Successfully added to db (total: %d)\n", i, total_ips_added);
-        }
-      } catch (const std::exception& e) {
-        printf("ThreadSeeder: [%d] Exception looking up %s: %s\n", i, seeds[i].c_str(), e.what());
+      LookupHost(seeds[i].c_str(), ips);
+      for (vector<CNetAddr>::iterator it = ips.begin(); it != ips.end(); it++) {
+        db.Add(CService(*it, GetDefaultPort()), true);
       }
     }
-    
-    printf("ThreadSeeder: Round complete. Added %d total IPs\n", total_ips_added);
-    printf("ThreadSeeder: Sleeping for 30 minutes (1800000ms)...\n");
     Sleep(1800000);
   } while(1);
   return nullptr;

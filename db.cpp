@@ -34,9 +34,7 @@ bool CAddrDb::Get_(CServiceResult &ip, int &wait) {
   int64 now = time(NULL);
   int cont = 0;
   int tot = unkId.size() + ourId.size();
-  printf("DB::Get_ called: unknown=%d, tried=%d, total=%d\n", (int)unkId.size(), (int)ourId.size(), tot);
   if (tot == 0) {
-    printf("DB::Get_ no nodes available, returning false\n");
     wait = 5;
     return false;
   }
@@ -131,41 +129,25 @@ void CAddrDb::Skipped_(const CService &addr)
 
 
 void CAddrDb::Add_(const CAddress &addr, bool force) {
-  printf("DB::Add_ called: %s force=%s\n", addr.ToString().c_str(), force ? "true" : "false");
-  
-  if (!force && !addr.IsRoutable()) {
-    printf("DB::Add_ rejected: not routable and not forced\n");
+  if (!force && !addr.IsRoutable())
     return;
-  }
-  
   CService ipp(addr);
-  printf("DB::Add_ CService: %s\n", ipp.ToString().c_str());
-  
   if (banned.count(ipp)) {
-    printf("DB::Add_ found in banned list\n");
     time_t bantime = banned[ipp];
-    if (force || (bantime < time(NULL) && addr.nTime > bantime)) {
-      printf("DB::Add_ unbanning (force=%s, expired=%s)\n", force ? "true" : "false", (bantime < time(NULL)) ? "true" : "false");
+    if (force || (bantime < time(NULL) && addr.nTime > bantime))
       banned.erase(ipp);
-    } else {
-      printf("DB::Add_ rejected: still banned\n");
+    else
       return;
-    }
   }
-  
   if (ipToId.count(ipp)) {
-    printf("DB::Add_ updating existing entry\n");
     CAddrInfo &ai = idToInfo[ipToId[ipp]];
     if (addr.nTime > ai.lastTry) ai.lastTry = addr.nTime;
     // Do not update ai.nServices (data from VERSION from the peer itself is better than random ADDR rumours).
     if (force) {
       ai.ignoreTill = 0;
     }
-    printf("DB::Add_ existing entry updated\n");
     return;
   }
-  
-  printf("DB::Add_ creating new entry\n");
   CAddrInfo ai;
   ai.ip = ipp;
   ai.services = addr.nServices;
@@ -176,10 +158,9 @@ void CAddrDb::Add_(const CAddress &addr, bool force) {
   int id = nId++;
   idToInfo[id] = ai;
   ipToId[ipp] = id;
-  printf("DB::Add_ assigned ID %d to %s\n", id, ipp.ToString().c_str());
+//  printf("%s: added\n", ToString(ipp).c_str(), ipToId[ipp]);
   unkId.insert(id);
   nDirty++;
-  printf("DB::Add_ successfully added! Total entries: %d, Unknown: %d\n", (int)idToInfo.size(), (int)unkId.size());
 }
 
 void CAddrDb::GetIPs_(set<CNetAddr>& ips, uint64_t requestedFlags, int max, const bool* nets) {
