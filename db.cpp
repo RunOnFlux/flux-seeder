@@ -1,9 +1,11 @@
 #include "db.h"
 #include <stdlib.h>
+#include <algorithm>
 
 using namespace std;
 
 int nMinimumHeight = 0;
+std::atomic<int> nNetworkHeight{0};
 
 void CAddrInfo::Update(bool good) {
   uint32_t now = time(NULL);
@@ -77,8 +79,20 @@ void CAddrDb::Good_(const CService &addr, int clientV, std::string clientSV, int
   info.blocks = blocks;
   info.services = services;
   info.Update(true);
-  if (info.IsGood() && goodId.count(id)==0) {
+  if (clientV >= REQUIRE_VERSION && blocks > 0) {
+    recentHeights.push_back(blocks);
+    if (recentHeights.size() > MAX_RECENT_HEIGHTS) recentHeights.pop_front();
+    if (recentHeights.size() >= MIN_RECENT_HEIGHTS) {
+      std::vector<int> heights(recentHeights.begin(), recentHeights.end());
+      auto median = heights.begin() + heights.size() / 2;
+      std::nth_element(heights.begin(), median, heights.end());
+      nNetworkHeight = *median;
+    }
+  }
+  if (info.IsGood()) {
     goodId.insert(id);
+  } else {
+    goodId.erase(id);
   }
   nDirty++;
   ourId.push_back(id);
@@ -157,7 +171,9 @@ void CAddrDb::Add_(const CAddress &addr, bool force) {
 void CAddrDb::GetIPs_(set<CNetAddr>& ips, uint64_t requestedFlags, int max, const bool* nets) {
   std::vector<int> goodIdFiltered;
   for (std::set<int>::const_iterator it = goodId.begin(); it != goodId.end(); it++) {
-    if ((idToInfo[*it].services & requestedFlags) == requestedFlags)
+    const CAddrInfo &info = idToInfo[*it];
+    // The required height moves with the network, so a node can stop being good between tests.
+    if ((info.services & requestedFlags) == requestedFlags && info.IsGood())
       goodIdFiltered.push_back(*it);
   }
 

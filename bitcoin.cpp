@@ -22,8 +22,29 @@ static const int HANDSHAKE_TIMEOUT = 30;
 // Maximum time (in seconds) from initiating a connection until it is closed, no matter what.
 static const int CONNECTION_TIMEOUT = 60;
 
-// Size of a serialized block header.
-static const size_t BLOCK_HEADER_SIZE = 80;
+// A Flux block header starts with nVersion, hashPrevBlock, hashMerkleRoot, hashFinalSaplingRoot,
+// nTime and nBits. A PON header (nVersion >= PON_VERSION) continues with nodesCollateral and
+// vchBlockSig, and its hash leaves out vchBlockSig. A POW header continues with nNonce and nSolution,
+// and its hash covers all of it.
+static const size_t HEADER_COMMON_SIZE = 4 + 32 + 32 + 32 + 4 + 4;
+static const size_t PON_COLLATERAL_SIZE = 32 + 4;
+static const size_t POW_NONCE_SIZE = 32;
+static const int32_t PON_VERSION = 100;
+
+// Reads one Flux block header from the stream and returns its hash.
+static uint256 ReadHeaderHash(DataStream& s) {
+  const std::byte* pstart = s.data();
+  if (s.size() < 4) throw std::ios_base::failure("truncated block header");
+  const int32_t nVersion = int32_t(uint32_t(pstart[0]) | uint32_t(pstart[1]) << 8 | uint32_t(pstart[2]) << 16 | uint32_t(pstart[3]) << 24);
+  if (nVersion >= PON_VERSION) {
+    s.ignore(HEADER_COMMON_SIZE + PON_COLLATERAL_SIZE);
+    s.ignore(ReadCompactSize(s)); // vchBlockSig
+    return Hash(std::span{pstart, HEADER_COMMON_SIZE + PON_COLLATERAL_SIZE});
+  }
+  s.ignore(HEADER_COMMON_SIZE + POW_NONCE_SIZE);
+  s.ignore(ReadCompactSize(s)); // nSolution
+  return Hash(std::span{pstart, size_t(s.data() - pstart)});
+}
 
 // Maximum number of addresses in an addr message (as in Bitcoin Core).
 static const size_t MAX_ADDR_TO_SEND = 1000;
@@ -94,7 +115,7 @@ class CNode {
     uint64_t nLocalNonce = BITCOIN_SEED_NONCE;
     uint64_t nLocalServices = 0;
     int nBestHeight = GetRequireHeight();
-    string ver = "/bitcoin-seeder:0.01/";
+    string ver = "/flux-seeder:1.0/";
     uint8_t fRelayTxs = 0;
     // The addresses in a version message are serialized as services + CService (without time).
     PushMessage("version", PROTOCOL_VERSION, nLocalServices, nTime, you.nServices, static_cast<const CService&>(you),
@@ -223,10 +244,8 @@ class CNode {
       fWaitKnownBlock = false;
       bool fMatch = false;
       if (ReadCompactSize(vRecv) == 1) {
-        std::array<std::byte, BLOCK_HEADER_SIZE> header;
-        vRecv >> header;
+        fMatch = ReadHeaderHash(vRecv) == hashKnownBlock;
         ReadCompactSize(vRecv); // Number of transactions (always 0).
-        fMatch = Hash(header) == hashKnownBlock;
       }
       if (!fMatch) return false;
       MaybeDone(time(NULL));
@@ -413,7 +432,7 @@ bool TestNode(const CService &cip, int &ban, int &clientV, std::string &clientSV
 
 /*
 int main(void) {
-  CService ip("bitcoin.sipa.be", 8333, true);
+  CService ip("dnsseed.runonflux.io", 16125, true);
   vector<CAddress> vAddr;
   vAddr.clear();
   int ban = 0;

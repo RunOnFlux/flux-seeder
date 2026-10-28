@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <bit>
+#include <atomic>
 
 #include "netbase.h"
 #include "protocol.h"
@@ -13,12 +14,22 @@
 
 #define MIN_RETRY 1000
 
-#define REQUIRE_VERSION 70001
+// Protocol version of the current network upgrade (PON). Nodes below it are disconnected by
+// current nodes, so they are never served.
+#define REQUIRE_VERSION 170020
+
+// How far (in blocks) a good node may be behind the network's height: 2880 blocks is one day.
+#define MAX_HEIGHT_LAG 2880
 
 extern int nMinimumHeight;
+// The network's height: the median starting height of recently tested nodes at REQUIRE_VERSION or
+// above, 0 until enough have been seen.
+extern std::atomic<int> nNetworkHeight;
 static inline int GetRequireHeight(const bool testnet = fTestNet)
 {
-    return nMinimumHeight ? nMinimumHeight : (testnet ? 500000 : 350000);
+    if (nMinimumHeight) return nMinimumHeight;
+    int nHeight = nNetworkHeight.load();
+    return nHeight > MAX_HEIGHT_LAG ? nHeight - MAX_HEIGHT_LAG : 1;
 }
 
 std::string static inline ToString(const CService &ip) {
@@ -206,6 +217,10 @@ private:
   std::set<int> unkId; // set of nodes not yet tried (b)
   std::set<int> goodId; // set of good nodes  (d, good e)
   int nDirty;
+  // Starting heights of the most recently tested nodes at REQUIRE_VERSION or above, oldest first.
+  std::deque<int> recentHeights;
+  static constexpr size_t MAX_RECENT_HEIGHTS = 256;
+  static constexpr size_t MIN_RECENT_HEIGHTS = 16;
   
 protected:
   // internal routines that assume proper locks are acquired

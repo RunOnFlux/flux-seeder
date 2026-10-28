@@ -67,7 +67,7 @@ public:
   CDnsSeedOpts() : nThreads(96), nDnsThreads(4), ip_addr("::"), nPort(53), nP2Port(0), nMinimumHeight(0), mbox(NULL), ns(NULL), host(NULL), tor(NULL), fUseTestNet(false), fWipeBan(false), fWipeIgnore(false), fNoDNS(false), nZoneInterval(120), ipv4_proxy(NULL), ipv6_proxy(NULL), magic(NULL), knownblock(NULL) {}
 
   void ParseCommandLine(int argc, char **argv) {
-    static const char *help = "Bitcoin-seeder\n"
+    static const char *help = "Flux-seeder\n"
                               "Usage: %s -h <host> -n <ns> [-m <mbox>] [-t <threads>] [-p <port>]\n"
                               "\n"
                               "Options:\n"
@@ -546,17 +546,14 @@ extern "C" void* ThreadStats(void*) {
   return nullptr;
 }
 
-static const string mainnet_seeds[] = {"dnsseed.bluematt.me", "bitseed.xf2.org", "dnsseed.bitcoin.dashjr.org", "seed.bitcoin.sipa.be", "kjy2eqzk4zwi5zd3.onion", ""};
-static const string testnet_seeds[] = {"testnet-seed.alexykot.me",
-                                       "testnet-seed.bitcoin.petertodd.org",
-                                       "testnet-seed.bluematt.me",
-                                       "testnet-seed.bitcoin.schildbach.de",
-                                       ""};
+static const string mainnet_seeds[] = {"dnsseed.runonflux.io", "dnsseed.zel.network", "dnsseed.asoftwaresolution.com", ""};
+static const string testnet_seeds[] = {"test.dnsseed.runonflux.io", "test.dnsseed.zel.network", "flux-testnet-seed.asoftwaresolution.com", ""};
 static const string *seeds = mainnet_seeds;
 
-// Blocks that good nodes must have in their active chain (from Bitcoin Core's assumeutxo data).
-static constexpr uint256 mainnet_known_block{"000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"}; // height 880000
-static constexpr uint256 testnet_known_block{"00000000000000f4971a7fb37fbdff89315b69a2e1920c467654a382f0d64786"}; // height 4840000
+// Blocks that good nodes must have in their active chain. A block above fluxd's last checkpoint, so
+// nodes answer getheaders with a full header rather than a compact one. Testnet has none.
+static constexpr uint256 mainnet_known_block{"3b88fea1225ba752a34f56c94d0e36ca7e35dc3b64eb8488d83aca9dc81f4ff1"}; // height 3070000
+static constexpr uint256 testnet_known_block{};
 static vector<string> vSeeds;
 
 /** Configuration for the zone file export thread. */
@@ -823,10 +820,10 @@ int main(int argc, char **argv) {
   bool fDNS = true;
   if (opts.fUseTestNet) {
       printf("Using testnet.\n");
-      pchMessageStart[0] = 0x0b;
-      pchMessageStart[1] = 0x11;
-      pchMessageStart[2] = 0x09;
-      pchMessageStart[3] = 0x07;
+      pchMessageStart[0] = 0xfa;
+      pchMessageStart[1] = 0x1a;
+      pchMessageStart[2] = 0xf9;
+      pchMessageStart[3] = 0xbf;
       seeds = testnet_seeds;
       fTestNet = true;
   }

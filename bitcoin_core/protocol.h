@@ -15,7 +15,7 @@
 #include <cassert>
 #include <string>
 
-static const int PROTOCOL_VERSION = 60000;
+static const int PROTOCOL_VERSION = 170021;
 
 //! disconnect from peers older than this proto version
 static const int MIN_PEER_PROTO_VERSION = 31800;
@@ -24,7 +24,7 @@ extern bool fTestNet;
 extern unsigned short nDefaultP2Port;
 static inline unsigned short GetDefaultPort(const bool testnet = fTestNet)
 {
-    return nDefaultP2Port ? nDefaultP2Port : (testnet ? 18333 : 8333);
+    return nDefaultP2Port ? nDefaultP2Port : (testnet ? 26125 : 16125);
 }
 
 //
