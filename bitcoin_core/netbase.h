@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "serialize.h"
-#include "compat.h"
+#include "compat/compat.h"
 
 extern int nConnectTimeout;
 
@@ -68,7 +68,6 @@ class CNetAddr
         std::string ToString() const;
         std::string ToStringIP() const;
         unsigned int GetByte(int n) const;
-        uint64 GetHash() const;
         bool GetInAddr(struct in_addr* pipv4Addr) const;
         std::vector<unsigned char> GetGroup() const;
         int GetReachabilityFrom(const CNetAddr *paddrPartner = NULL) const;
@@ -81,10 +80,10 @@ class CNetAddr
         friend bool operator!=(const CNetAddr& a, const CNetAddr& b);
         friend bool operator<(const CNetAddr& a, const CNetAddr& b);
 
-        IMPLEMENT_SERIALIZE
-            (
-             READWRITE(FLATDATA(ip));
-            )
+        SERIALIZE_METHODS(CNetAddr, obj)
+        {
+            READWRITE(obj.ip);
+        }
 };
 
 /** A combination of a network address (CNetAddr) and a (TCP) port */
@@ -119,15 +118,10 @@ class CService : public CNetAddr
         CService(const struct in6_addr& ipv6Addr, unsigned short port);
         CService(const struct sockaddr_in6& addr);
 
-        IMPLEMENT_SERIALIZE
-            (
-             CService* pthis = const_cast<CService*>(this);
-             READWRITE(FLATDATA(ip));
-             unsigned short portN = htons(port);
-             READWRITE(portN);
-             if (fRead)
-                 pthis->port = ntohs(portN);
-            )
+        SERIALIZE_METHODS(CService, obj)
+        {
+            READWRITE(AsBase<CNetAddr>(obj), Using<BigEndianFormatter<2>>(obj.port));
+        }
 };
 
 enum Network ParseNetwork(std::string net);
@@ -142,7 +136,8 @@ bool LookupHostNumeric(const char *pszName, std::vector<CNetAddr>& vIP, unsigned
 bool Lookup(const char *pszName, CService& addr, int portDefault = 0, bool fAllowLookup = true);
 bool Lookup(const char *pszName, std::vector<CService>& vAddr, int portDefault = 0, bool fAllowLookup = true, unsigned int nMaxSolutions = 0);
 bool LookupNumeric(const char *pszName, CService& addr, int portDefault = 0);
-bool ConnectSocket(const CService &addr, SOCKET& hSocketRet, int nTimeout = nConnectTimeout);
+// nDeadline (a time(NULL) value, or 0 for none) bounds the negotiation with a proxy, if one is used.
+bool ConnectSocket(const CService &addr, SOCKET& hSocketRet, int nTimeout = nConnectTimeout, int64_t nDeadline = 0);
 bool ConnectSocketByName(CService &addr, SOCKET& hSocketRet, const char *pszDest, int portDefault = 0, int nTimeout = nConnectTimeout);
 
 #endif

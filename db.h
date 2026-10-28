@@ -5,6 +5,8 @@
 #include <map>
 #include <vector>
 #include <deque>
+#include <bit>
+#include <atomic>
 
 #include "netbase.h"
 #include "protocol.h"
@@ -12,11 +14,22 @@
 
 #define MIN_RETRY 1000
 
-#define REQUIRE_VERSION 70001
+// Protocol version of the current network upgrade (PON). Nodes below it are disconnected by
+// current nodes, so they are never served.
+#define REQUIRE_VERSION 170020
 
+// How far (in blocks) a good node may be behind the network's height: 2880 blocks is one day.
+#define MAX_HEIGHT_LAG 2880
+
+extern int nMinimumHeight;
+// The network's height: the median starting height of recently tested nodes at REQUIRE_VERSION or
+// above, 0 until enough have been seen.
+extern std::atomic<int> nNetworkHeight;
 static inline int GetRequireHeight(const bool testnet = fTestNet)
 {
-    return testnet ? 100000 : 1000000;
+    if (nMinimumHeight) return nMinimumHeight;
+    int nHeight = nNetworkHeight.load();
+    return nHeight > MAX_HEIGHT_LAG ? nHeight - MAX_HEIGHT_LAG : 1;
 }
 
 std::string static inline ToString(const CService &ip) {
@@ -24,6 +37,12 @@ std::string static inline ToString(const CService &ip) {
   while (str.size() < 22) str += ' ';
   return str;
 }
+
+/** Serializes floats as their IEEE 754 binary32 representation, in little endian order. */
+struct FloatFormatter {
+  template<typename Stream> void Ser(Stream& s, float f) { ser_writedata32(s, std::bit_cast<uint32_t>(f)); }
+  template<typename Stream> void Unser(Stream& s, float& f) { f = std::bit_cast<float>(ser_readdata32(s)); }
+};
 
 class CAddrStat {
 private:
@@ -33,18 +52,16 @@ private:
 public:
   CAddrStat() : weight(0), count(0), reliability(0) {}
 
-  void Update(bool good, int64 age, double tau) {
+  void Update(bool good, int64_t age, double tau) {
     double f =  exp(-age/tau);
     reliability = reliability * f + (good ? (1.0-f) : 0);
     count = count * f + 1;
     weight = weight * f + (1.0-f);
   }
   
-  IMPLEMENT_SERIALIZE (
-    READWRITE(weight);
-    READWRITE(count);
-    READWRITE(reliability);
-  )
+  SERIALIZE_METHODS(CAddrStat, obj) {
+    READWRITE(Using<FloatFormatter>(obj.weight), Using<FloatFormatter>(obj.count), Using<FloatFormatter>(obj.reliability));
+  }
 
   friend class CAddrInfo;
 };
@@ -66,10 +83,10 @@ class CAddrInfo {
 private:
   CService ip;
   uint64_t services;
-  int64 lastTry;
-  int64 ourLastTry;
-  int64 ourLastSuccess;
-  int64 ignoreTill;
+  int64_t lastTry;
+  int64_t ourLastTry;
+  int64_t ourLastSuccess;
+  int64_t ignoreTill;
   CAddrStat stat2H;
   CAddrStat stat8H;
   CAddrStat stat1D;
@@ -105,7 +122,7 @@ public:
     if (!(services & NODE_NETWORK)) return false;
     if (!ip.IsRoutable()) return false;
     if (clientVersion && clientVersion < REQUIRE_VERSION) return false;
-    if (blocks && blocks < GetRequireHeight()) return false;
+    if (blocks < GetRequireHeight()) return false;
 
     if (total <= 3 && success * 2 >= total) return true;
 
@@ -138,37 +155,27 @@ public:
   
   friend class CAddrDb;
   
-  IMPLEMENT_SERIALIZE (
-    unsigned char version = 4;
-    READWRITE(version);
-    READWRITE(ip);
-    READWRITE(services);
-    READWRITE(lastTry);
-    unsigned char tried = ourLastTry != 0;
+  SERIALIZE_METHODS(CAddrInfo, obj) {
+    uint8_t version = 4;
+    READWRITE(version, obj.ip, obj.services, obj.lastTry);
+    uint8_t tried = obj.ourLastTry != 0;
     READWRITE(tried);
     if (tried) {
-      READWRITE(ourLastTry);
-      READWRITE(ignoreTill);
-      READWRITE(stat2H);
-      READWRITE(stat8H);
-      READWRITE(stat1D);
-      READWRITE(stat1W);
-      if (version >= 1)
-          READWRITE(stat1M);
-      else
-          if (!fWrite)
-              *((CAddrStat*)(&stat1M)) = stat1W;
-      READWRITE(total);
-      READWRITE(success);
-      READWRITE(clientVersion);
+      READWRITE(obj.ourLastTry, obj.ignoreTill, obj.stat2H, obj.stat8H, obj.stat1D, obj.stat1W);
+      if (version >= 1) {
+        READWRITE(obj.stat1M);
+      } else {
+        SER_READ(obj, obj.stat1M = obj.stat1W);
+      }
+      READWRITE(obj.total, obj.success, obj.clientVersion);
       if (version >= 2)
-          READWRITE(clientSubVersion);
+        READWRITE(obj.clientSubVersion);
       if (version >= 3)
-          READWRITE(blocks);
+        READWRITE(obj.blocks);
       if (version >= 4)
-          READWRITE(ourLastSuccess);
+        READWRITE(obj.ourLastSuccess);
     }
-  )
+  }
 };
 
 class CAddrDbStats {
@@ -189,7 +196,7 @@ struct CServiceResult {
     int nHeight;
     int nClientV;
     std::string strClientV;
-    int64 ourLastSuccess;
+    int64_t ourLastSuccess;
 };
 
 //             seen nodes
@@ -210,6 +217,10 @@ private:
   std::set<int> unkId; // set of nodes not yet tried (b)
   std::set<int> goodId; // set of good nodes  (d, good e)
   int nDirty;
+  // Starting heights of the most recently tested nodes at REQUIRE_VERSION or above, oldest first.
+  std::deque<int> recentHeights;
+  static constexpr size_t MAX_RECENT_HEIGHTS = 256;
+  static constexpr size_t MIN_RECENT_HEIGHTS = 16;
   
 protected:
   // internal routines that assume proper locks are acquired
@@ -220,10 +231,10 @@ protected:
   void Bad_(const CService &ip, int ban);  // mark an IP as bad (and optionally ban it) (must have been returned by Get_)
   void Skipped_(const CService &ip);       // mark an IP as skipped (must have been returned by Get_)
   int Lookup_(const CService &ip);         // look up id of an IP
-  void GetIPs_(std::set<CNetAddr>& ips, uint64_t requestedFlags, int max, const bool *nets); // get a random set of IPs (shared lock only)
+  void GetIPs_(std::set<CNetAddr>& ips, uint64_t requestedFlags, int max, const bool *nets); // get a random set of good IPs (shared lock only)
 
 public:
-  std::map<CService, time_t> banned; // nodes that are banned, with their unban time (a)
+  std::map<CService, int64_t> banned; // nodes that are banned, with their unban time (a)
 
   void GetStats(CAddrDbStats &stats) {
     SHARED_CRITICAL_BLOCK(cs) {
@@ -232,7 +243,11 @@ public:
       stats.nTracked = ourId.size();
       stats.nGood = goodId.size();
       stats.nNew = unkId.size();
-      stats.nAge = time(NULL) - idToInfo[ourId[0]].ourLastTry;
+      stats.nAge = 0;
+      if (!ourId.empty()) {
+        std::map<int, CAddrInfo>::const_iterator it = idToInfo.find(ourId.front());
+        if (it != idToInfo.end()) stats.nAge = time(NULL) - it->second.ourLastTry;
+      }
     }
   }
 
@@ -261,49 +276,47 @@ public:
   //   n (number of ips in (b,c,d))
   //   CAddrInfo[n]
   //   banned
-  // acquires a shared lock (this does not suffice for read mode, but we assume that only happens at startup, single-threaded)
-  // this way, dumping does not interfere with GetIPs_, which is called from the DNS thread
-  IMPLEMENT_SERIALIZE (({
+  // writing only acquires a shared lock, so that dumping does not interfere with GetIPs_, which is called from the DNS thread
+  template<typename Stream>
+  void Serialize(Stream& s) const {
     int nVersion = 0;
-    READWRITE(nVersion);
+    s << nVersion;
     SHARED_CRITICAL_BLOCK(cs) {
-      if (fWrite) {
-        CAddrDb *db = const_cast<CAddrDb*>(this);
-        int n = ourId.size() + unkId.size();
-        READWRITE(n);
-        for (std::deque<int>::const_iterator it = ourId.begin(); it != ourId.end(); it++) {
-          std::map<int, CAddrInfo>::iterator ci = db->idToInfo.find(*it);
-          READWRITE((*ci).second);
-        }
-        for (std::set<int>::const_iterator it = unkId.begin(); it != unkId.end(); it++) {
-          std::map<int, CAddrInfo>::iterator ci = db->idToInfo.find(*it);
-          READWRITE((*ci).second);
-        }
-      } else {
-        CAddrDb *db = const_cast<CAddrDb*>(this);
-        db->nId = 0;
-        int n = 0;
-        READWRITE(n);
-        for (int i=0; i<n; i++) {
-          CAddrInfo info;
-          READWRITE(info);
-          if (!info.GetBanTime()) {
-            int id = db->nId++;
-            db->idToInfo[id] = info;
-            db->ipToId[info.ip] = id;
-            if (info.ourLastTry) {
-              db->ourId.push_back(id);
-              if (info.IsGood()) db->goodId.insert(id);
-            } else {
-              db->unkId.insert(id);
-            }
+      int n = ourId.size() + unkId.size();
+      s << n;
+      for (int id : ourId) s << idToInfo.at(id);
+      for (int id : unkId) s << idToInfo.at(id);
+      s << banned;
+    }
+  }
+
+  template<typename Stream>
+  void Unserialize(Stream& s) {
+    int nVersion;
+    s >> nVersion;
+    CRITICAL_BLOCK(cs) {
+      nId = 0;
+      int n;
+      s >> n;
+      for (int i=0; i<n; i++) {
+        CAddrInfo info;
+        s >> info;
+        if (!info.GetBanTime()) {
+          int id = nId++;
+          idToInfo[id] = info;
+          ipToId[info.ip] = id;
+          if (info.ourLastTry) {
+            ourId.push_back(id);
+            if (info.IsGood()) goodId.insert(id);
+          } else {
+            unkId.insert(id);
           }
         }
-        db->nDirty++;
       }
-      READWRITE(banned);
+      nDirty++;
+      s >> banned;
     }
-  });)
+  }
 
   void Add(const CAddress &addr, bool fForce = false) {
     CRITICAL_BLOCK(cs)

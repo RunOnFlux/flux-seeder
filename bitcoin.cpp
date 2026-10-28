@@ -1,28 +1,82 @@
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <span>
+#include <vector>
 
 #include "db.h"
 #include "netbase.h"
 #include "protocol.h"
 #include "serialize.h"
+#include "streams.h"
 #include "uint256.h"
+#include "util.h"
+#include "util/strencodings.h"
 
 #define BITCOIN_SEED_NONCE  0x0539a019ca550825ULL
 
+// Maximum time (in seconds) from initiating a connection until the version handshake completes
+// (that is, until verack is received).
+static const int HANDSHAKE_TIMEOUT = 30;
+
+// Maximum time (in seconds) from initiating a connection until it is closed, no matter what.
+static const int CONNECTION_TIMEOUT = 60;
+
+// A Flux block header starts with nVersion, hashPrevBlock, hashMerkleRoot, hashFinalSaplingRoot,
+// nTime and nBits. A PON header (nVersion >= PON_VERSION) continues with nodesCollateral and
+// vchBlockSig, and its hash leaves out vchBlockSig. A POW header continues with nNonce and nSolution,
+// and its hash covers all of it.
+static const size_t HEADER_COMMON_SIZE = 4 + 32 + 32 + 32 + 4 + 4;
+static const size_t PON_COLLATERAL_SIZE = 32 + 4;
+static const size_t POW_NONCE_SIZE = 32;
+static const int32_t PON_VERSION = 100;
+
+// Reads one Flux block header from the stream and returns its hash.
+static uint256 ReadHeaderHash(DataStream& s) {
+  const std::byte* pstart = s.data();
+  if (s.size() < 4) throw std::ios_base::failure("truncated block header");
+  const int32_t nVersion = int32_t(uint32_t(pstart[0]) | uint32_t(pstart[1]) << 8 | uint32_t(pstart[2]) << 16 | uint32_t(pstart[3]) << 24);
+  if (nVersion >= PON_VERSION) {
+    s.ignore(HEADER_COMMON_SIZE + PON_COLLATERAL_SIZE);
+    s.ignore(ReadCompactSize(s)); // vchBlockSig
+    return Hash(std::span{pstart, HEADER_COMMON_SIZE + PON_COLLATERAL_SIZE});
+  }
+  s.ignore(HEADER_COMMON_SIZE + POW_NONCE_SIZE);
+  s.ignore(ReadCompactSize(s)); // nSolution
+  return Hash(std::span{pstart, size_t(s.data() - pstart)});
+}
+
+// Maximum number of addresses in an addr message (as in Bitcoin Core).
+static const size_t MAX_ADDR_TO_SEND = 1000;
+
+// Maximum number of entries in an inv message. Bitcoin Core accepts up to 50000 (MAX_INV_SZ), but
+// the inv messages nodes send us are much smaller.
+static const uint64_t MAX_INV_SIZE = 5000;
+
+// Maximum size (in bytes) of received messages. The largest messages we process (addr messages with
+// 1000 addresses) are about 30 kB.
+static const unsigned int MAX_RECEIVED_MESSAGE_SIZE = 256 * 1024;
+
 using namespace std;
+
+uint256 hashKnownBlock;
 
 class CNode {
   SOCKET sock;
-  CDataStream vSend;
-  CDataStream vRecv;
-  unsigned int nHeaderStart;
-  unsigned int nMessageStart;
+  vector<std::byte> vSend;
+  vector<std::byte> vRecv;
   int nVersion;
   string strSubVer;
   int nStartingHeight;
   vector<CAddress> *vAddr;
   int ban;
-  int64 doneAfter;
+  int64_t doneAfter;
   CAddress you;
+  bool fGotVersion;
+  bool fGotVerAck;
+  bool fGotAddr;
+  // Whether we're still waiting for the response to our request for the known block's header.
+  bool fWaitKnownBlock;
 
   int GetTimeout() {
       if (you.IsTor())
@@ -31,40 +85,23 @@ class CNode {
           return 30;
   }
 
-  void BeginMessage(const char *pszCommand) {
-    if (nHeaderStart != -1) AbortMessage();
-    nHeaderStart = vSend.size();
-    vSend << CMessageHeader(pszCommand, 0);
-    nMessageStart = vSend.size();
-//    printf("%s: SEND %s\n", ToString(you).c_str(), pszCommand); 
+  template<typename... Args>
+  void PushMessage(const char *pszCommand, const Args&... args) {
+    DataStream payload;
+    (payload << ... << args);
+    CMessageHeader hdr(pszCommand, payload.size());
+    uint256 hash = Hash(std::span{payload.data(), payload.size()});
+    memcpy(hdr.pchChecksum, hash.begin(), CMessageHeader::CHECKSUM_SIZE);
+    DataStream header;
+    header << hdr;
+    vSend.insert(vSend.end(), header.begin(), header.end());
+    vSend.insert(vSend.end(), payload.begin(), payload.end());
   }
-  
-  void AbortMessage() {
-    if (nHeaderStart == -1) return;
-    vSend.resize(nHeaderStart);
-    nHeaderStart = -1;
-    nMessageStart = -1;
-  }
-  
-  void EndMessage() {
-    if (nHeaderStart == -1) return;
-    unsigned int nSize = vSend.size() - nMessageStart;
-    memcpy((char*)&vSend[nHeaderStart] + offsetof(CMessageHeader, nMessageSize), &nSize, sizeof(nSize));
-    if (vSend.GetVersion() >= 209) {
-      uint256 hash = Hash(vSend.begin() + nMessageStart, vSend.end());
-      unsigned int nChecksum = 0;
-      memcpy(&nChecksum, &hash, sizeof(nChecksum));
-      assert(nMessageStart - nHeaderStart >= offsetof(CMessageHeader, nChecksum) + sizeof(nChecksum));
-      memcpy((char*)&vSend[nHeaderStart] + offsetof(CMessageHeader, nChecksum), &nChecksum, sizeof(nChecksum));
-    }
-    nHeaderStart = -1;
-    nMessageStart = -1;
-  }
-  
+
   void Send() {
     if (sock == INVALID_SOCKET) return;
     if (vSend.empty()) return;
-    int nBytes = send(sock, &vSend[0], vSend.size(), 0);
+    int nBytes = send(sock, vSend.data(), vSend.size(), 0);
     if (nBytes > 0) {
       vSend.erase(vSend.begin(), vSend.begin() + nBytes);
     } else {
@@ -74,152 +111,248 @@ class CNode {
   }
   
   void PushVersion() {
-    int64 nTime = time(NULL);
-    uint64 nLocalNonce = BITCOIN_SEED_NONCE;
-    int64 nLocalServices = 0;
-    CAddress me(CService("0.0.0.0"));
-    BeginMessage("version");
+    int64_t nTime = time(NULL);
+    uint64_t nLocalNonce = BITCOIN_SEED_NONCE;
+    uint64_t nLocalServices = 0;
     int nBestHeight = GetRequireHeight();
-    string ver = "/MagicBean:7.2.0(flux)/";
+    string ver = "/flux-seeder:1.0/";
     uint8_t fRelayTxs = 0;
-    vSend << PROTOCOL_VERSION << nLocalServices << nTime << you << me << nLocalNonce << ver << nBestHeight << fRelayTxs;
-    EndMessage();
+    // The addresses in a version message are serialized as services + CService (without time).
+    PushMessage("version", PROTOCOL_VERSION, nLocalServices, nTime, you.nServices, static_cast<const CService&>(you),
+                uint64_t{NODE_NETWORK}, CService("0.0.0.0"), nLocalNonce, ver, nBestHeight, fRelayTxs);
   }
  
   void GotVersion() {
-    // printf("\n%s: version %i\n", ToString(you).c_str(), nVersion);
+    if (!hashKnownBlock.IsNull()) {
+      // Request the header of the known block. With an empty locator, nodes respond with just the
+      // header of the hashStop block, if it is in their active chain.
+      PushMessage("getheaders", PROTOCOL_VERSION, vector<uint256>{}, hashKnownBlock);
+      fWaitKnownBlock = true;
+    }
     if (vAddr) {
-      BeginMessage("getaddr");
-      EndMessage();
-      doneAfter = time(NULL) + GetTimeout();
-    } else {
-      doneAfter = time(NULL) + 1;
+      PushMessage("getaddr");
+    }
+    doneAfter = time(NULL) + (vAddr || fWaitKnownBlock ? GetTimeout() : 1);
+  }
+
+  // Called when the response to an outstanding request was received, to finish soon if nothing else is outstanding.
+  void MaybeDone(int64_t now) {
+    if ((!vAddr || fGotAddr) && !fWaitKnownBlock) {
+      if (doneAfter == 0 || doneAfter > now + 1) doneAfter = now + 1;
     }
   }
 
-  bool ProcessMessage(string strCommand, CDataStream& vRecv) {
-    //printf("%s: RECV %s\n", ToString(you).c_str(), strCommand.c_str());
+  // Process a received message. Returns false if the peer misbehaved (in which case the caller
+  // disconnects it).
+  bool ProcessMessage(string strCommand, DataStream& vRecv) {
     if (strCommand == "version") {
-      int64 nTime;
-      CAddress addrMe;
-      CAddress addrFrom;
-      uint64 nNonce = 1;
-      vRecv >> nVersion >> you.nServices >> nTime >> addrMe;
-      if (nVersion == 10300) nVersion = 300;
-      if (nVersion >= 106 && !vRecv.empty())
-        vRecv >> addrFrom >> nNonce;
-      if (nVersion >= 106 && !vRecv.empty())
-        vRecv >> strSubVer;
-      if (nVersion >= 209 && !vRecv.empty())
+      if (fGotVersion) {
+        return true;
+      }
+      int64_t nTime;
+      uint64_t nServicesMe, nServicesFrom;
+      CService addrMe, addrFrom;
+      uint64_t nNonce = 1;
+      vRecv >> nVersion >> you.nServices >> nTime >> nServicesMe >> addrMe;
+      if (nVersion < MIN_PEER_PROTO_VERSION) {
+        // Such old peers use message formats we don't support, and don't support getheaders.
+        return false;
+      }
+      if (!vRecv.empty())
+        vRecv >> nServicesFrom >> addrFrom >> nNonce;
+      if (!vRecv.empty()) {
+        vRecv >> LIMITED_STRING(strSubVer, 256);
+        strSubVer = SanitizeString(strSubVer);
+      }
+      if (!vRecv.empty())
         vRecv >> nStartingHeight;
-      
-      if (nVersion >= 209) {
-        BeginMessage("verack");
-        EndMessage();
-      }
-      vSend.SetVersion(min(nVersion, PROTOCOL_VERSION));
-      if (nVersion < 209) {
-        this->vRecv.SetVersion(min(nVersion, PROTOCOL_VERSION));
-        GotVersion();
-      }
-      return false;
+      fGotVersion = true;
+      PushMessage("verack");
+      return true;
+    }
+
+    if (!fGotVersion) {
+      return true;
     }
     
     if (strCommand == "verack") {
-      this->vRecv.SetVersion(min(nVersion, PROTOCOL_VERSION));
+      if (fGotVerAck) {
+        return true;
+      }
+      fGotVerAck = true;
       GotVersion();
-      return false;
+      return true;
     }
-    
-    if (strCommand == "addr" && vAddr) {
+
+    if (!fGotVerAck) {
+      return true;
+    }
+
+    if (strCommand == "addr") {
+      uint64_t nCount = ReadCompactSize(vRecv);
+      if (nCount > MAX_ADDR_TO_SEND) {
+        // Disconnect before deserializing the addresses.
+        return false;
+      }
       vector<CAddress> vAddrNew;
-      vRecv >> vAddrNew;
-      // printf("%s: got %i addresses\n", ToString(you).c_str(), (int)vAddrNew.size());
-      int64 now = time(NULL);
+      vAddrNew.reserve(nCount);
+      for (uint64_t i = 0; i < nCount; i++) {
+        CAddress addr;
+        vRecv >> addr;
+        vAddrNew.push_back(addr);
+      }
+      if (!vAddr) return true;
+      int64_t now = time(NULL);
       vector<CAddress>::iterator it = vAddrNew.begin();
       if (vAddrNew.size() > 1) {
-        if (doneAfter == 0 || doneAfter > now + 1) doneAfter = now + 1;
+        fGotAddr = true;
+        MaybeDone(now);
       }
       while (it != vAddrNew.end()) {
         CAddress &addr = *it;
-//        printf("%s: got address %s\n", ToString(you).c_str(), addr.ToString().c_str(), (int)(vAddr->size()));
         it++;
         if (addr.nTime <= 100000000 || addr.nTime > now + 600)
           addr.nTime = now - 5 * 86400;
         if (addr.nTime > now - 604800)
           vAddr->push_back(addr);
-//        printf("%s: added address %s (#%i)\n", ToString(you).c_str(), addr.ToString().c_str(), (int)(vAddr->size()));
         if (vAddr->size() > 1000) {doneAfter = 1; return true; }
       }
-      return false;
+      return true;
     }
-    
-    return false;
+
+    if (strCommand == "inv") {
+      // Our version message asks peers not to relay transactions to us (fRelay = 0). Like Bitcoin
+      // Core in blocks-only mode, disconnect peers that announce transactions anyway. As we don't
+      // negotiate wtxidrelay, MSG_WTX announcements are ignored, as Bitcoin Core does.
+      uint64_t nCount = ReadCompactSize(vRecv);
+      if (nCount > MAX_INV_SIZE) {
+        // Disconnect before deserializing the entries.
+        return false;
+      }
+      for (uint64_t i = 0; i < nCount; i++) {
+        uint32_t type;
+        uint256 hash;
+        vRecv >> type >> hash;
+        if (type == MSG_TX || type == MSG_WITNESS_TX) return false;
+      }
+      return true;
+    }
+
+    if (strCommand == "headers" && fWaitKnownBlock) {
+      // We expect exactly the header of the known block. Nodes that don't have it in their active
+      // chain don't respond, or respond with no headers.
+      fWaitKnownBlock = false;
+      bool fMatch = false;
+      if (ReadCompactSize(vRecv) == 1) {
+        fMatch = ReadHeaderHash(vRecv) == hashKnownBlock;
+        ReadCompactSize(vRecv); // Number of transactions (always 0).
+      }
+      if (!fMatch) return false;
+      MaybeDone(time(NULL));
+      return true;
+    }
+
+    return true;
   }
   
   bool ProcessMessages() {
     if (vRecv.empty()) return false;
+    const auto magic = std::as_bytes(std::span{pchMessageStart});
+    const size_t nHeaderSize = CMessageHeader::HEADER_SIZE;
     do {
-      CDataStream::iterator pstart = search(vRecv.begin(), vRecv.end(), BEGIN(pchMessageStart), END(pchMessageStart));
-      int nHeaderSize = vRecv.GetSerializeSize(CMessageHeader());
-      if (vRecv.end() - pstart < nHeaderSize) {
+      auto pstart = search(vRecv.begin(), vRecv.end(), magic.begin(), magic.end());
+      if (size_t(vRecv.end() - pstart) < nHeaderSize) {
         if (vRecv.size() > nHeaderSize) {
           vRecv.erase(vRecv.begin(), vRecv.end() - nHeaderSize);
         }
         break;
       }
       vRecv.erase(vRecv.begin(), pstart);
-      vector<char> vHeaderSave(vRecv.begin(), vRecv.begin() + nHeaderSize);
       CMessageHeader hdr;
-      vRecv >> hdr;
+      DataStream{std::span<const std::byte>{vRecv}.first(nHeaderSize)} >> hdr;
       if (!hdr.IsValid()) { 
-        // printf("%s: BAD (invalid header)\n", ToString(you).c_str());
         ban = 100000; return true;
       }
       string strCommand = hdr.GetCommand();
       unsigned int nMessageSize = hdr.nMessageSize;
       if (nMessageSize > MAX_SIZE) { 
-        // printf("%s: BAD (message too large)\n", ToString(you).c_str());
         ban = 100000;
         return true; 
       }
-      if (nMessageSize > vRecv.size()) {
-        vRecv.insert(vRecv.begin(), vHeaderSave.begin(), vHeaderSave.end());
+      if (nMessageSize > MAX_RECEIVED_MESSAGE_SIZE) {
+        // Disconnect before receiving (and buffering) the message.
+        close(sock);
+        sock = INVALID_SOCKET;
+        return true;
+      }
+      if (nHeaderSize + nMessageSize > vRecv.size()) {
         break;
       }
-      if (vRecv.GetVersion() >= 209) {
-        uint256 hash = Hash(vRecv.begin(), vRecv.begin() + nMessageSize);
-        unsigned int nChecksum = 0;
-        memcpy(&nChecksum, &hash, sizeof(nChecksum));
-        if (nChecksum != hdr.nChecksum) continue;
-      }
-      CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
-      vRecv.ignore(nMessageSize);
-      if (ProcessMessage(strCommand, vMsg))
+      auto payload = std::span<const std::byte>{vRecv}.subspan(nHeaderSize, nMessageSize);
+      uint256 hash = Hash(payload);
+      if (memcmp(hash.begin(), hdr.pchChecksum, CMessageHeader::CHECKSUM_SIZE) != 0) {
+        close(sock);
+        sock = INVALID_SOCKET;
         return true;
-//      printf("%s: done processing %s\n", ToString(you).c_str(), strCommand.c_str());
+      }
+      DataStream vMsg{payload};
+      vRecv.erase(vRecv.begin(), vRecv.begin() + nHeaderSize + nMessageSize);
+      bool success;
+      try {
+        success = ProcessMessage(strCommand, vMsg);
+      } catch (const std::ios_base::failure&) {
+        // The message could not be deserialized.
+        success = false;
+      }
+      if (!success) {
+        close(sock);
+        sock = INVALID_SOCKET;
+        return true;
+      }
+      if (doneAfter == 1) {
+        // Enough addresses were received; ignore any further messages.
+        return true;
+      }
     } while(1);
     return false;
   }
   
 public:
-  CNode(const CService& ip, vector<CAddress>* vAddrIn) : you(ip), nHeaderStart(-1), nMessageStart(-1), vAddr(vAddrIn), ban(0), doneAfter(0), nVersion(0) {
-    vSend.SetType(SER_NETWORK);
-    vSend.SetVersion(0);
-    vRecv.SetType(SER_NETWORK);
-    vRecv.SetVersion(0);
-    if (time(NULL) > 1329696000) {
-      vSend.SetVersion(209);
-      vRecv.SetVersion(209);
-    }
+  CNode(const CService& ip, vector<CAddress>* vAddrIn) : sock(INVALID_SOCKET), you(ip), vAddr(vAddrIn), ban(0), doneAfter(0), nVersion(0), nStartingHeight(0) {
+    fGotVersion = false;
+    fGotVerAck = false;
+    fGotAddr = false;
+    fWaitKnownBlock = false;
   }
+  CNode(const CNode&) = delete;
+  CNode& operator=(const CNode&) = delete;
+
+  ~CNode() {
+    // Make sure the socket is closed, also if processing was aborted (e.g. by an exception).
+    if (sock != INVALID_SOCKET) close(sock);
+  }
+
   bool Run() {
     bool res = true;
-    if (!ConnectSocket(you, sock)) return false;
+    const int64_t start = time(NULL);
+    const int64_t handshakeDeadline = start + HANDSHAKE_TIMEOUT;
+    const int64_t connectionDeadline = start + CONNECTION_TIMEOUT;
+    // The negotiation with a proxy (if any) is part of the handshake, so it must finish before the
+    // handshake deadline (which is before the connection deadline).
+    if (!ConnectSocket(you, sock, nConnectTimeout, handshakeDeadline)) return false;
     PushVersion();
     Send();
-    int64 now;
+    int64_t now;
     while (now = time(NULL), ban == 0 && (doneAfter == 0 || doneAfter > now) && sock != INVALID_SOCKET) {
+      if (now >= connectionDeadline) {
+        // Just drop the connection.
+        if (!doneAfter) res = false;
+        break;
+      }
+      if (!doneAfter && now >= handshakeDeadline) {
+        res = false;
+        break;
+      }
       char pchBuf[0x10000];
       fd_set read_set, except_set;
       FD_ZERO(&read_set);
@@ -227,13 +360,8 @@ public:
       FD_SET(sock,&read_set);
       FD_SET(sock,&except_set);
       struct timeval wa;
-      if (doneAfter) {
-        wa.tv_sec = doneAfter - now;
-        wa.tv_usec = 0;
-      } else {
-        wa.tv_sec = GetTimeout();
-        wa.tv_usec = 0;
-      }
+      wa.tv_sec = min<int64_t>(doneAfter ? doneAfter : handshakeDeadline, connectionDeadline) - now;
+      wa.tv_usec = 0;
       int ret = select(sock+1, &read_set, NULL, &except_set, &wa);
       if (ret != 1) {
         if (!doneAfter) res = false;
@@ -245,11 +373,9 @@ public:
         vRecv.resize(nPos + nBytes);
         memcpy(&vRecv[nPos], pchBuf, nBytes);
       } else if (nBytes == 0) {
-        // printf("%s: BAD (connection closed prematurely)\n", ToString(you).c_str());
         res = false;
         break;
       } else {
-        // printf("%s: BAD (connection error)\n", ToString(you).c_str());
         res = false;
         break;
       }
@@ -257,6 +383,7 @@ public:
       Send();
     }
     if (sock == INVALID_SOCKET) res = false;
+    if (fWaitKnownBlock) res = false;
     close(sock);
     sock = INVALID_SOCKET;
     return (ban == 0) && res;
@@ -296,7 +423,6 @@ bool TestNode(const CService &cip, int &ban, int &clientV, std::string &clientSV
     clientSV = node.GetClientSubVersion();
     blocks = node.GetStartingHeight();
     services = node.GetServices();
-//  printf("%s: %s!!!\n", cip.ToString().c_str(), ret ? "GOOD" : "BAD");
     return ret;
   } catch(std::ios_base::failure& e) {
     ban = 0;
@@ -306,7 +432,7 @@ bool TestNode(const CService &cip, int &ban, int &clientV, std::string &clientSV
 
 /*
 int main(void) {
-  CService ip("bitcoin.sipa.be", 8333, true);
+  CService ip("dnsseed.runonflux.io", 16125, true);
   vector<CAddress> vAddr;
   vAddr.clear();
   int ban = 0;

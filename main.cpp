@@ -7,23 +7,52 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
+#include <ctype.h>
+#include <errno.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <atomic>
+#include <chrono>
+#include <optional>
+#include <random>
+#include <string>
+#include <utility>
 
 #include "bitcoin.h"
 #include "db.h"
+#include "streams.h"
+#include "util/strencodings.h"
 
 using namespace std;
 
 bool fTestNet = false;
 
+/** Parse a decimal integer in the range [min, max] (the entire string must be a number). */
+static bool ParseRangedInt(const char *str, long min, long max, int& out) {
+  char *end;
+  errno = 0;
+  long n = strtol(str, &end, 10);
+  if (end == str || *end != '\0' || errno != 0 || n < min || n > max) return false;
+  out = n;
+  return true;
+}
+
 class CDnsSeedOpts {
 public:
   int nThreads;
   int nPort;
+  int nP2Port;
+  int nMinimumHeight;
   int nDnsThreads;
   int fUseTestNet;
   int fWipeBan;
   int fWipeIgnore;
+  int fNoDNS;
+  std::string zonefile;
+  std::string zoneReload;
+  int nZoneInterval;
   const char *mbox;
   const char *ns;
   const char *host;
@@ -31,15 +60,19 @@ public:
   const char *ip_addr;
   const char *ipv4_proxy;
   const char *ipv6_proxy;
+  const char *magic;
+  const char *knownblock;
+  std::vector<string> vSeeds;
   std::set<uint64_t> filter_whitelist;
 
-  CDnsSeedOpts() : nThreads(96), nDnsThreads(4), ip_addr("::"), nPort(53), mbox(NULL), ns(NULL), host(NULL), tor(NULL), fUseTestNet(false), fWipeBan(false), fWipeIgnore(false), ipv4_proxy(NULL), ipv6_proxy(NULL) {}
+  CDnsSeedOpts() : nThreads(96), nDnsThreads(4), ip_addr("::"), nPort(53), nP2Port(0), nMinimumHeight(0), mbox(NULL), ns(NULL), host(NULL), tor(NULL), fUseTestNet(false), fWipeBan(false), fWipeIgnore(false), fNoDNS(false), nZoneInterval(120), ipv4_proxy(NULL), ipv6_proxy(NULL), magic(NULL), knownblock(NULL) {}
 
   void ParseCommandLine(int argc, char **argv) {
-    static const char *help = "Bitcoin-seeder\n"
+    static const char *help = "Flux-seeder\n"
                               "Usage: %s -h <host> -n <ns> [-m <mbox>] [-t <threads>] [-p <port>]\n"
                               "\n"
                               "Options:\n"
+                              "-s <seed>       Seed node to collect peers from (replaces default)\n"
                               "-h <host>       Hostname of the DNS seed\n"
                               "-n <ns>         Hostname of the nameserver\n"
                               "-m <mbox>       E-Mail address reported in SOA records\n"
@@ -51,15 +84,26 @@ public:
                               "-i <ip:port>    IPV4 SOCKS5 proxy IP/Port\n"
                               "-k <ip:port>    IPV6 SOCKS5 proxy IP/Port\n"
                               "-w f1,f2,...    Allow these flag combinations as filters\n"
+                              "--p2port <port> P2P port to connect to\n"
+                              "--magic <hex>   Magic string/network prefix\n"
+                              "--minheight <n> Minimum height of block chain\n"
+                              "--knownblock <hash> Hash of a block that good nodes must have\n"
                               "--testnet       Use testnet\n"
                               "--wipeban       Wipe list of banned nodes\n"
                               "--wipeignore    Wipe list of ignored nodes\n"
+                              "--nodns         Don't run the built-in DNS server\n"
+                              "--zonefile <file>       Periodically export a DNS zone file with good nodes (requires -h, -n, -m)\n"
+                              "--zone-interval <secs>  Interval between zone file exports, and TTL of the addresses (10-86400, default 120)\n"
+                              "--zone-reload <command> Command to run after each zone file export (e.g. \"rndc reload <host>\");\n"
+                              "                        it is killed if it takes longer than 60 seconds (or the interval)\n"
                               "-?, --help      Show this text\n"
                               "\n";
     bool showHelp = false;
+    bool fError = false;
 
     while(1) {
       static struct option long_options[] = {
+        {"seed", required_argument, 0, 's'},
         {"host", required_argument, 0, 'h'},
         {"ns",   required_argument, 0, 'n'},
         {"mbox", required_argument, 0, 'm'},
@@ -71,16 +115,29 @@ public:
         {"proxyipv4", required_argument, 0, 'i'},
         {"proxyipv6", required_argument, 0, 'k'},
         {"filter", required_argument, 0, 'w'},
+        {"p2port", required_argument, 0, 'b'},
+        {"magic", required_argument, 0, 'q'},
+        {"minheight", required_argument, 0, 'x'},
+        {"knownblock", required_argument, 0, 'K'},
         {"testnet", no_argument, &fUseTestNet, 1},
         {"wipeban", no_argument, &fWipeBan, 1},
         {"wipeignore", no_argument, &fWipeBan, 1},
-        {"help", no_argument, 0, 'h'},
+        {"nodns", no_argument, &fNoDNS, 1},
+        {"zonefile", required_argument, 0, 'Z'},
+        {"zone-interval", required_argument, 0, 'I'},
+        {"zone-reload", required_argument, 0, 'R'},
+        {"help", no_argument, 0, 'H'},
         {0, 0, 0, 0}
       };
       int option_index = 0;
-      int c = getopt_long(argc, argv, "h:n:m:t:a:p:d:o:i:k:w:", long_options, &option_index);
+      int c = getopt_long(argc, argv, "s:h:n:m:t:a:p:d:o:i:k:w:b:q:x:", long_options, &option_index);
       if (c == -1) break;
       switch (c) {
+        case 's': {
+          vSeeds.emplace_back(optarg);
+          break;
+        }
+
         case 'h': {
           host = optarg;
           break;
@@ -155,8 +212,68 @@ public:
           break;
         }
 
-        case '?': {
+        case 'b': {
+          int p = strtol(optarg, NULL, 10);
+          if (p > 0 && p < 65536) nP2Port = p;
+          break;
+        }
+
+        case 'q': {
+          long int n;
+          unsigned int c;
+          if (strlen(optarg)!=8) {
+            break; /* must be 4 hex-encoded bytes */
+          }
+          n = strtol(optarg, NULL, 16);
+          if (n==0 && strcmp(optarg, "00000000")) {
+            break; /* hex decode failed */
+          }
+          magic = optarg;
+          break;
+        }
+
+        case 'x': {
+          int n = strtol(optarg, NULL, 10);
+          if (n > 0 && n <= 0x7fffffff) nMinimumHeight = n;
+          break;
+        }
+
+        case 'K': {
+          if (!uint256::FromHex(optarg)) {
+            fprintf(stderr, "Invalid block hash: %s\n", optarg);
+            exit(1);
+          }
+          knownblock = optarg;
+          break;
+        }
+
+        case 'H': {
           showHelp = true;
+          break;
+        }
+
+        case 'Z': {
+          zonefile = optarg;
+          break;
+        }
+
+        case 'I': {
+          if (!ParseRangedInt(optarg, 10, 86400, nZoneInterval)) {
+            fprintf(stderr, "Invalid zone export interval (must be 10 to 86400 seconds): %s\n", optarg);
+            exit(1);
+          }
+          break;
+        }
+
+        case 'R': {
+          zoneReload = optarg;
+          break;
+        }
+
+        case '?': {
+          // Either an explicit -?, or an unknown option / missing argument.
+          showHelp = true;
+          if (optopt != '?') fError = true;
           break;
         }
       }
@@ -166,15 +283,25 @@ public:
         filter_whitelist.insert(NODE_NETWORK | NODE_BLOOM); // x5
         filter_whitelist.insert(NODE_NETWORK | NODE_WITNESS); // x9
         filter_whitelist.insert(NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS); // x49
+        filter_whitelist.insert(NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2); // x809
+        filter_whitelist.insert(NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2 | NODE_COMPACT_FILTERS); //x849
         filter_whitelist.insert(NODE_NETWORK | NODE_WITNESS | NODE_BLOOM); // xd
         filter_whitelist.insert(NODE_NETWORK_LIMITED); // x400
         filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_BLOOM); // x404
         filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_WITNESS); // x408
         filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_COMPACT_FILTERS); // x448
+        filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_P2P_V2); // xc08
+        filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_P2P_V2 | NODE_COMPACT_FILTERS); // xc48
         filter_whitelist.insert(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_BLOOM); // x40c
     }
-    if (host != NULL && ns == NULL) showHelp = true;
-    if (showHelp) fprintf(stderr, help, argv[0]);
+    if (host != NULL && ns == NULL) {
+      showHelp = true;
+      fError = true;
+    }
+    if (showHelp) {
+      fprintf(stderr, help, argv[0]);
+      exit(fError ? 1 : 0);
+    }
   }
 };
 
@@ -188,7 +315,7 @@ extern "C" void* ThreadCrawler(void* data) {
     std::vector<CServiceResult> ips;
     int wait = 5;
     db.GetMany(ips, 16, wait);
-    int64 now = time(NULL);
+    int64_t now = time(NULL);
     if (ips.empty()) {
       wait *= 1000;
       wait += rand() % (500 * *nThreads);
@@ -363,33 +490,41 @@ extern "C" void* ThreadDumper(void*) {
       FILE *f = fopen("dnsseed.dat.new","w+");
       if (f) {
         {
-          CAutoFile cf(f);
+          AutoFile cf(f);
           cf << db;
         }
         rename("dnsseed.dat.new", "dnsseed.dat");
       }
       FILE *d = fopen("dnsseed.dump", "w");
-      fprintf(d, "# address                                        good  lastSuccess    %%(2h)   %%(8h)   %%(1d)   %%(7d)  %%(30d)  blocks      svcs  version\n");
+      if (d) fprintf(d, "# address                                        good  lastSuccess    %%(2h)   %%(8h)   %%(1d)   %%(7d)  %%(30d)  blocks      svcs  version\n");
       double stat[5]={0,0,0,0,0};
       for (vector<CAddrReport>::const_iterator it = v.begin(); it < v.end(); it++) {
         CAddrReport rep = *it;
-        fprintf(d, "%-47s  %4d  %11" PRId64 "  %6.2f%% %6.2f%% %6.2f%% %6.2f%% %6.2f%%  %6i  %08" PRIx64 "  %5i \"%s\"\n", rep.ip.ToString().c_str(), (int)rep.fGood, rep.lastSuccess, 100.0*rep.uptime[0], 100.0*rep.uptime[1], 100.0*rep.uptime[2], 100.0*rep.uptime[3], 100.0*rep.uptime[4], rep.blocks, rep.services, rep.clientVersion, rep.clientSubVersion.c_str());
+        if (d) fprintf(d, "%-47s  %4d  %11" PRId64 "  %6.2f%% %6.2f%% %6.2f%% %6.2f%% %6.2f%%  %6i  %08" PRIx64 "  %5i \"%s\"\n", rep.ip.ToString().c_str(), (int)rep.fGood, rep.lastSuccess, 100.0*rep.uptime[0], 100.0*rep.uptime[1], 100.0*rep.uptime[2], 100.0*rep.uptime[3], 100.0*rep.uptime[4], rep.blocks, rep.services, rep.clientVersion, SanitizeString(rep.clientSubVersion).c_str());
         stat[0] += rep.uptime[0];
         stat[1] += rep.uptime[1];
         stat[2] += rep.uptime[2];
         stat[3] += rep.uptime[3];
         stat[4] += rep.uptime[4];
       }
-      fclose(d);
+      if (d) fclose(d);
       FILE *ff = fopen("dnsstats.log", "a");
-      fprintf(ff, "%llu %g %g %g %g %g\n", (unsigned long long)(time(NULL)), stat[0], stat[1], stat[2], stat[3], stat[4]);
-      fclose(ff);
+      if (ff) {
+        fprintf(ff, "%llu %g %g %g %g %g\n", (unsigned long long)(time(NULL)), stat[0], stat[1], stat[2], stat[3], stat[4]);
+        fclose(ff);
+      }
     }
   } while(1);
   return nullptr;
 }
 
+// Interval (in seconds) between status lines when stdout is not a terminal (e.g. under systemd).
+static const int STATS_LOG_INTERVAL = 600;
+
 extern "C" void* ThreadStats(void*) {
+  // On a terminal one status line is redrawn every second; otherwise a plain line is printed
+  // every STATS_LOG_INTERVAL seconds.
+  const bool fTerminal = isatty(STDOUT_FILENO);
   bool first = true;
   do {
     char c[256];
@@ -398,14 +533,15 @@ extern "C" void* ThreadStats(void*) {
     strftime(c, 256, "[%y-%m-%d %H:%M:%S]", tmp);
     CAddrDbStats stats;
     db.GetStats(stats);
-    if (first)
-    {
-      first = false;
-      printf("\n\n\n\x1b[3A");
+    if (fTerminal) {
+      if (first) {
+        first = false;
+        printf("\n\n\n\x1b[3A");
+      } else {
+        printf("\x1b[2K\x1b[u");
+      }
+      printf("\x1b[s");
     }
-    else
-      printf("\x1b[2K\x1b[u");
-    printf("\x1b[s");
     uint64_t requests = 0;
     uint64_t queries = 0;
     for (unsigned int i=0; i<dnsThread.size(); i++) {
@@ -413,24 +549,243 @@ extern "C" void* ThreadStats(void*) {
       queries += dnsThread[i]->dbQueries;
     }
     printf("%s %i/%i available (%i tried in %is, %i new, %i active), %i banned; %llu DNS requests, %llu db queries", c, stats.nGood, stats.nAvail, stats.nTracked, stats.nAge, stats.nNew, stats.nAvail - stats.nTracked - stats.nNew, stats.nBanned, (unsigned long long)requests, (unsigned long long)queries);
-    Sleep(1000);
+    if (!fTerminal) {
+      printf("\n");
+      fflush(stdout);
+    }
+    Sleep(fTerminal ? 1000 : STATS_LOG_INTERVAL * 1000);
   } while(1);
   return nullptr;
 }
 
-static const string mainnet_seeds[] = {"vps.zel.network", "vps.runonflux.io", "dnsseed.zel.network", "dnsseed.runonflux.io", ""};
-static const string testnet_seeds[] = {"flux-testnet-seed.asoftwaresolution.com",
-                                       ""};
+static const string mainnet_seeds[] = {"dnsseed.runonflux.io", "dnsseed.zel.network", "dnsseed.asoftwaresolution.com", ""};
+static const string testnet_seeds[] = {"test.dnsseed.runonflux.io", "test.dnsseed.zel.network", "flux-testnet-seed.asoftwaresolution.com", ""};
 static const string *seeds = mainnet_seeds;
 
-extern "C" void* ThreadSeeder(void*) {
-  if (!fTestNet){
-//    db.Add(CService("kjy2eqzk4zwi5zd3.onion", 8333), true);
+// Blocks that good nodes must have in their active chain. A block above fluxd's last checkpoint, so
+// nodes answer getheaders with a full header rather than a compact one. Testnet has none.
+static constexpr uint256 mainnet_known_block{"3b88fea1225ba752a34f56c94d0e36ca7e35dc3b64eb8488d83aca9dc81f4ff1"}; // height 3070000
+static constexpr uint256 testnet_known_block{};
+static vector<string> vSeeds;
+
+/** Configuration for the zone file export thread. */
+struct ZoneExportConfig {
+  std::string path;
+  std::string reload;
+  std::string host;
+  std::string ns;
+  std::string mbox;
+  int interval;
+  std::set<uint64_t> filters;
+};
+
+static ZoneExportConfig zoneExport;
+
+/** Maximum time (in seconds) the reload command may run (if the export interval isn't shorter). */
+static const int ZONE_RELOAD_TIMEOUT = 60;
+
+/** Maximum size of answers from the exported zone. Answers to clients that don't use EDNS (such as
+ *  glibc by default) are limited to 512 bytes; larger answers make those clients retry over TCP,
+ *  and their lookups fail entirely if that doesn't work. Also leave room for an OPT record with a
+ *  DNS cookie (11 + 44 bytes), so that answers also fit for clients that use EDNS with a 512-byte
+ *  buffer. */
+static const size_t ZONE_MAX_ANSWER_SIZE = 512 - 55;
+
+/** Determine how many address records with rdlen-byte addresses fit in an answer for the given
+ *  absolute name, without exceeding ZONE_MAX_ANSWER_SIZE. */
+static size_t MaxZoneAddrs(const std::string& name, size_t rdlen) {
+  // Header (12 bytes), and question: name (in wire format, one byte longer than its absolute text
+  // form), type and class (4 bytes).
+  const size_t fixed = 12 + name.size() + 1 + 4;
+  // Each record: compressed owner name (2 bytes), type, class, TTL and rdlength (10 bytes), and the
+  // address.
+  return fixed < ZONE_MAX_ANSWER_SIZE ? (ZONE_MAX_ANSWER_SIZE - fixed) / (12 + rdlen) : 0;
+}
+
+/** Convert a name to an absolute (fully-qualified) one, as needed in zone files. */
+static std::string AbsoluteName(const std::string& name) {
+  return name.ends_with(".") ? name : name + ".";
+}
+
+/** Build the contents of a zone file with the given serial. Returns an empty string if there are
+ *  no good nodes (so that a zone without addresses is never exported, and the previous zone is
+ *  kept). */
+static std::string BuildZone(const ZoneExportConfig& cfg, uint32_t serial) {
+  const std::string apex = AbsoluteName(cfg.host);
+  std::string zone = strprintf("; Generated by dnsseed\n$TTL %i\n", cfg.interval);
+  // Refresh, retry, and expire only matter for secondary servers. Negative answers may be cached
+  // for 60 seconds.
+  zone += strprintf("%s IN SOA %s %s %u 3600 600 86400 60\n", apex.c_str(), AbsoluteName(cfg.ns).c_str(), AbsoluteName(cfg.mbox).c_str(), serial);
+  zone += strprintf("%s IN NS %s\n", apex.c_str(), AbsoluteName(cfg.ns).c_str());
+
+  bool nets[NET_MAX] = {};
+  nets[NET_IPV4] = true;
+  nets[NET_IPV6] = true;
+  std::mt19937_64 rng{std::random_device{}()};
+  bool any = false;
+  // The zone apex (without filter), followed by the whitelisted filter names.
+  std::vector<std::pair<std::string, uint64_t>> names{{apex, 0}};
+  for (uint64_t flags : cfg.filters) {
+    names.emplace_back(strprintf("x%llx.%s", (unsigned long long)flags, apex.c_str()), flags);
+  }
+  for (const auto& [name, flags] : names) {
+    set<CNetAddr> ips;
+    db.GetIPs(ips, flags, 1000, nets);
+    std::vector<CNetAddr> v4, v6;
+    for (const CNetAddr& ip : ips) {
+      if (ip.IsIPv4()) {
+        v4.push_back(ip);
+      } else if (ip.IsIPv6()) {
+        v6.push_back(ip);
+      }
+    }
+    for (auto [addrs, max] : {std::pair{&v4, MaxZoneAddrs(name, 4)}, std::pair{&v6, MaxZoneAddrs(name, 16)}}) {
+      std::shuffle(addrs->begin(), addrs->end(), rng);
+      if (addrs->size() > max) addrs->resize(max);
+      for (const CNetAddr& ip : *addrs) {
+        zone += strprintf("%s IN %s %s\n", name.c_str(), ip.IsIPv4() ? "A" : "AAAA", ip.ToStringIP().c_str());
+        any = true;
+      }
+    }
+  }
+  return any ? zone : std::string{};
+}
+
+/** Read the SOA serial from a zone file. Returns nothing if the file can't be read, or doesn't
+ *  contain an SOA record. */
+static std::optional<uint32_t> ReadZoneSerial(const std::string& path) {
+  FILE *f = fopen(path.c_str(), "r");
+  if (!f) return std::nullopt;
+  std::string data;
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+  fclose(f);
+  // Split into tokens, skipping comments and parentheses (which allow records to span lines).
+  std::vector<std::string> tokens;
+  std::string token;
+  bool comment = false;
+  for (char c : data) {
+    if (c == '\n') comment = false;
+    if (c == ';') comment = true;
+    if (comment || isspace((unsigned char)c) || c == '(' || c == ')') {
+      if (!token.empty()) tokens.push_back(std::move(token));
+      token.clear();
+    } else {
+      token += c;
+    }
+  }
+  if (!token.empty()) tokens.push_back(std::move(token));
+  // The SOA type is followed by the primary nameserver, the mailbox, and the serial.
+  for (size_t i = 0; i + 3 < tokens.size(); ++i) {
+    if (strcasecmp(tokens[i].c_str(), "SOA") != 0) continue;
+    const std::string& str = tokens[i + 3];
+    char *end;
+    errno = 0;
+    unsigned long long serial = strtoull(str.c_str(), &end, 10);
+    if (str.empty() || !isdigit((unsigned char)str[0]) || *end != '\0' || errno != 0 || serial > 0xFFFFFFFF) return std::nullopt;
+    return serial;
+  }
+  return std::nullopt;
+}
+
+/** Determine the serial for the next zone export: the current time, unless that is not greater
+ *  than the previous serial (using DNS serial number arithmetic, RFC 1982), for example after the
+ *  clock was set back, in which case the previous serial plus one. */
+static uint32_t NextZoneSerial(std::optional<uint32_t> prev, int64_t now) {
+  uint32_t serial = uint32_t(now);
+  if (prev && int32_t(serial - *prev) <= 0) serial = *prev + 1;
+  return serial;
+}
+
+/** Run a command using the shell. If it takes longer than timeout seconds, it is killed (along
+ *  with any processes it started). Returns whether it ran successfully; otherwise error is set. */
+static bool RunCommand(const std::string& command, int timeout, std::string& error) {
+  const char *cmd = command.c_str();
+  pid_t pid = fork();
+  if (pid < 0) {
+    error = strprintf("could not start it (%s)", strerror(errno));
+    return false;
+  }
+  if (pid == 0) {
+    // Use a new process group, so that processes started by the command can be killed too.
+    setpgid(0, 0);
+    execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+    _exit(127);
+  }
+  setpgid(pid, pid);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+  int status;
+  while (true) {
+    pid_t ret = waitpid(pid, &status, WNOHANG);
+    if (ret == pid) break;
+    if (ret < 0 && errno != EINTR) {
+      error = strprintf("waiting for it failed (%s)", strerror(errno));
+      return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(-pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      error = strprintf("killed after %i seconds", timeout);
+      return false;
+    }
+    Sleep(100);
+  }
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+  error = WIFEXITED(status) ? strprintf("exit status %i", WEXITSTATUS(status)) : strprintf("terminated by signal %i", WTERMSIG(status));
+  return false;
+}
+
+/** Periodically export a zone file with good nodes, and run the reload command afterwards. */
+extern "C" void* ThreadZoneExport(void*) {
+  const ZoneExportConfig& cfg = zoneExport;
+  // Continue from the serial of the previously exported zone (if any), so that the serial keeps
+  // increasing across restarts.
+  std::optional<uint32_t> serial = ReadZoneSerial(cfg.path);
+  if (!serial && access(cfg.path.c_str(), F_OK) == 0) {
+    fprintf(stderr, "Warning: could not read the SOA serial from existing zone file %s\n", cfg.path.c_str());
   }
   do {
-    for (int i=0; seeds[i] != ""; i++) {
+    // The serial must increase with every export (or DNS servers will refuse to reload the zone).
+    uint32_t next = NextZoneSerial(serial, time(NULL));
+    std::string zone = BuildZone(cfg, next);
+    if (!zone.empty()) {
+      // Write to a temporary file first, and then atomically replace the zone file.
+      std::string tmp = cfg.path + ".new";
+      FILE *f = fopen(tmp.c_str(), "w");
+      bool ok = f && fwrite(zone.data(), 1, zone.size(), f) == zone.size();
+      if (f && fclose(f) != 0) ok = false;
+      if (ok && rename(tmp.c_str(), cfg.path.c_str()) == 0) {
+        serial = next;
+        std::string error;
+        if (!cfg.reload.empty() && !RunCommand(cfg.reload, std::min(cfg.interval, ZONE_RELOAD_TIMEOUT), error)) {
+          fprintf(stderr, "\nZone reload command failed: %s\n", error.c_str());
+        }
+      } else {
+        fprintf(stderr, "\nFailed to write zone file %s\n", cfg.path.c_str());
+      }
+    }
+    // If there was nothing to export yet (e.g. shortly after starting without dnsseed.dat), try
+    // again sooner.
+    Sleep((zone.empty() ? std::min(cfg.interval, 60) : cfg.interval) * 1000);
+  } while(1);
+  return nullptr;
+}
+
+extern "C" void* ThreadSeeder(void*) {
+  vector<string> vDnsSeeds;
+  for (const string& seed: vSeeds) {
+    size_t len = seed.size();
+    if (len > 6 && !seed.compare(len - 6, 6, ".onion")) {
+      db.Add(CService(seed.c_str(), GetDefaultPort()), true);
+    } else {
+      vDnsSeeds.push_back(seed);
+    }
+  }
+  do {
+    for (const string& seed: vDnsSeeds) {
       vector<CNetAddr> ips;
-      LookupHost(seeds[i].c_str(), ips);
+      LookupHost(seed.c_str(), ips);
       for (vector<CNetAddr>::iterator it = ips.begin(); it != ips.end(); it++) {
         db.Add(CService(*it, GetDefaultPort()), true);
       }
@@ -484,9 +839,47 @@ int main(int argc, char **argv) {
       seeds = testnet_seeds;
       fTestNet = true;
   }
+  if (opts.nP2Port) {
+    printf("Using P2P port %i\n", opts.nP2Port);
+    nDefaultP2Port = opts.nP2Port;
+  }
+  if (opts.magic) {
+    printf("Using magic %s\n", opts.magic);
+    for (int n=0; n<4; ++n) {
+      unsigned int c = 0;
+      sscanf(&opts.magic[n*2], "%2x", &c);
+      pchMessageStart[n] = (unsigned char) (c & 0xff);
+    }
+  }
+  if (opts.nMinimumHeight) {
+    printf("Using minimum height %i\n", opts.nMinimumHeight);
+    nMinimumHeight = opts.nMinimumHeight;
+  }
+  if (opts.knownblock) {
+    printf("Using known block %s\n", opts.knownblock);
+    hashKnownBlock = *uint256::FromHex(opts.knownblock);
+  } else if (!opts.magic) {
+    // There is no default known block for custom networks.
+    hashKnownBlock = fTestNet ? testnet_known_block : mainnet_known_block;
+  }
+  if (!opts.vSeeds.empty()) {
+    printf("Overriding DNS seeds\n");
+    swap(opts.vSeeds, vSeeds);
+  } else {
+    for (int i=0; seeds[i][0]; i++) {
+      vSeeds.emplace_back(seeds[i]);
+    }
+  }
   if (!opts.ns) {
     printf("No nameserver set. Not starting DNS server.\n");
     fDNS = false;
+  } else if (opts.fNoDNS) {
+    printf("Not starting DNS server.\n");
+    fDNS = false;
+  }
+  if (!opts.zonefile.empty() && (!opts.host || !opts.ns || !opts.mbox)) {
+    fprintf(stderr, "Exporting a zone file requires -h, -n, and -m.\n");
+    exit(1);
   }
   if (fDNS && !opts.host) {
     fprintf(stderr, "No hostname set. Please use -h.\n");
@@ -499,7 +892,7 @@ int main(int argc, char **argv) {
   FILE *f = fopen("dnsseed.dat","r");
   if (f) {
     printf("Loading dnsseed.dat...");
-    CAutoFile cf(f);
+    AutoFile cf(f);
     cf >> db;
     if (opts.fWipeBan)
         db.banned.clear();
@@ -507,7 +900,7 @@ int main(int argc, char **argv) {
         db.ResetIgnores();
     printf("done\n");
   }
-  pthread_t threadDns, threadSeed, threadDump, threadStats;
+  pthread_t threadDns, threadSeed, threadDump, threadStats, threadZone;
   if (fDNS) {
     printf("Starting %i DNS threads for %s on %s (port %i)...", opts.nDnsThreads, opts.host, opts.ns, opts.nPort);
     dnsThread.clear();
@@ -518,6 +911,11 @@ int main(int argc, char **argv) {
       Sleep(20);
     }
     printf("done\n");
+  }
+  if (!opts.zonefile.empty()) {
+    zoneExport = {opts.zonefile, opts.zoneReload, opts.host, opts.ns, opts.mbox, opts.nZoneInterval, opts.filter_whitelist};
+    printf("Exporting zone file %s every %i seconds\n", opts.zonefile.c_str(), opts.nZoneInterval);
+    pthread_create(&threadZone, NULL, ThreadZoneExport, NULL);
   }
   printf("Starting seeder...");
   pthread_create(&threadSeed, NULL, ThreadSeeder, NULL);

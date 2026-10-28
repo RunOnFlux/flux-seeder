@@ -12,13 +12,19 @@
 
 #include "netbase.h"
 #include "serialize.h"
+#include <cassert>
 #include <string>
-#include "uint256.h"
+
+static const int PROTOCOL_VERSION = 170021;
+
+//! disconnect from peers older than this proto version
+static const int MIN_PEER_PROTO_VERSION = 31800;
 
 extern bool fTestNet;
+extern unsigned short nDefaultP2Port;
 static inline unsigned short GetDefaultPort(const bool testnet = fTestNet)
 {
-    return testnet ? 26125 : 16125;
+    return nDefaultP2Port ? nDefaultP2Port : (testnet ? 26125 : 16125);
 }
 
 //
@@ -39,22 +45,20 @@ class CMessageHeader
         std::string GetCommand() const;
         bool IsValid() const;
 
-        IMPLEMENT_SERIALIZE
-            (
-             READWRITE(FLATDATA(pchMessageStart));
-             READWRITE(FLATDATA(pchCommand));
-             READWRITE(nMessageSize);
-             if (nVersion >= 209)
-             READWRITE(nChecksum);
-            )
+        SERIALIZE_METHODS(CMessageHeader, obj)
+        {
+            READWRITE(obj.pchMessageStart, obj.pchCommand, obj.nMessageSize, obj.pchChecksum);
+        }
 
     // TODO: make private (improves encapsulation)
     public:
         enum { COMMAND_SIZE=12 };
+        static constexpr size_t CHECKSUM_SIZE = 4;
+        static constexpr size_t HEADER_SIZE = 24;
         char pchMessageStart[sizeof(::pchMessageStart)];
         char pchCommand[COMMAND_SIZE];
         unsigned int nMessageSize;
-        unsigned int nChecksum;
+        uint8_t pchChecksum[CHECKSUM_SIZE];
 };
 
 enum
@@ -64,64 +68,42 @@ enum
     NODE_WITNESS = (1 << 3),
     NODE_COMPACT_FILTERS = (1 << 6),
     NODE_NETWORK_LIMITED = (1 << 10),
+    NODE_P2P_V2 = (1 << 11),
+};
+
+/** getdata message type flags */
+inline constexpr uint32_t MSG_WITNESS_FLAG = 1 << 30;
+
+/** getdata / inv message types (the ones that can occur in inv messages). */
+enum GetDataMsg : uint32_t {
+    MSG_TX = 1,
+    MSG_BLOCK = 2,
+    MSG_WTX = 5,                                      //!< Defined in BIP 339
+    MSG_WITNESS_TX = MSG_TX | MSG_WITNESS_FLAG,       //!< Defined in BIP144
 };
 
 class CAddress : public CService
 {
     public:
         CAddress();
-        CAddress(CService ipIn, uint64 nServicesIn=NODE_NETWORK);
+        CAddress(CService ipIn, uint64_t nServicesIn=NODE_NETWORK);
 
         void Init();
 
-        IMPLEMENT_SERIALIZE
-            (
-             CAddress* pthis = const_cast<CAddress*>(this);
-             CService* pip = (CService*)pthis;
-             if (fRead)
-                 pthis->Init();
-             if (nType & SER_DISK)
-             READWRITE(nVersion);
-             if ((nType & SER_DISK) || (nVersion >= 31402 && !(nType & SER_GETHASH)))
-             READWRITE(nTime);
-             READWRITE(nServices);
-             READWRITE(*pip);
-            )
+        // Serialization as used in addr messages.
+        SERIALIZE_METHODS(CAddress, obj)
+        {
+            READWRITE(obj.nTime, obj.nServices, AsBase<CService>(obj));
+        }
 
         void print() const;
 
     // TODO: make private (improves encapsulation)
     public:
-        uint64 nServices;
+        uint64_t nServices;
 
         // disk and network only
         unsigned int nTime;
-};
-
-class CInv
-{
-    public:
-        CInv();
-        CInv(int typeIn, const uint256& hashIn);
-        CInv(const std::string& strType, const uint256& hashIn);
-
-        IMPLEMENT_SERIALIZE
-        (
-            READWRITE(type);
-            READWRITE(hash);
-        )
-
-        friend bool operator<(const CInv& a, const CInv& b);
-
-        bool IsKnownType() const;
-        const char* GetCommand() const;
-        std::string ToString() const;
-        void print() const;
-
-    // TODO: make private (improves encapsulation)
-    public:
-        int type;
-        uint256 hash;
 };
 
 #endif // __INCLUDED_PROTOCOL_H__
